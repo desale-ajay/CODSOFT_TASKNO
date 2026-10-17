@@ -1,0 +1,327 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix
+)
+
+
+folder_path = r"C:\Users\ajayd\Desktop\Anaconda\archive"
+
+print("Files found:", os.listdir(folder_path))
+
+def load_dataset(keyword):
+    files = []
+    for pattern in ["*.xlsx", "*.xls", "*.csv"]:
+        files.extend(glob.glob(os.path.join(folder_path, pattern)))
+
+    matches = [
+        f for f in files
+        if keyword.lower() in os.path.basename(f).lower()
+    ]
+
+    if not matches:
+        raise FileNotFoundError(
+            f"No file containing '{keyword}' was found in {folder_path}"
+        )
+
+    file_path = matches[0]
+
+    if file_path.lower().endswith(".csv"):
+        return pd.read_csv(file_path)
+
+    return pd.read_excel(file_path)
+
+train_df = load_dataset("fraudtrain")
+test_df = load_dataset("fraudtest")
+
+print("Training dataset shape:", train_df.shape)
+print("Testing dataset shape:", test_df.shape)
+
+display(train_df.head())
+print("Columns:", train_df.columns.tolist())
+
+# Standardize column names
+train_df.columns = train_df.columns.str.strip().str.lower()
+test_df.columns = test_df.columns.str.strip().str.lower()
+
+possible_targets = ["is_fraud", "fraud", "class", "target", "label"]
+
+target = next(
+    (col for col in possible_targets if col in train_df.columns),
+    None
+)
+
+if target is None:
+    raise ValueError(
+        "Fraud target column not found. Check the printed column names."
+    )
+
+print("Target column:", target)
+print("\nFraud distribution:")
+print(train_df[target].value_counts())
+
+sns.countplot(data=train_df, x=target)
+plt.title("Legitimate vs Fraudulent Transactions")
+plt.xlabel("Class (0 = Legitimate, 1 = Fraud)")
+plt.ylabel("Number of Transactions")
+plt.show()
+
+def prepare_features(df):
+    df = df.copy()
+
+    # Extract information from a transaction timestamp, if present
+    date_col = next(
+        (c for c in ["trans_date_trans_time", "transaction_time", "timestamp"]
+         if c in df.columns),
+        None
+    )
+
+    if date_col:
+        dt = pd.to_datetime(df[date_col], errors="coerce")
+        df["transaction_hour"] = dt.dt.hour
+        df["transaction_day"] = dt.dt.day
+        df["transaction_month"] = dt.dt.month
+        df = df.drop(columns=[date_col])
+
+    # Remove columns that are identifiers or contain personal details
+    remove_cols = [
+        "cc_num", "credit_card_number", "trans_num", "transaction_id",
+        "id", "first", "last", "street", "dob", "name", "customer_id"
+    ]
+
+    df = df.drop(
+        columns=[c for c in remove_cols if c in df.columns],
+        errors="ignore"
+    )
+
+    return df
+
+X_train_all = prepare_features(train_df.drop(columns=[target]))
+
+# Keep only features that also exist in the training data
+X_test_all = prepare_features(
+    test_df.drop(columns=[target], errors="ignore")
+)
+X_test_all = X_test_all.reindex(columns=X_train_all.columns)
+
+y_train_all = train_df[target]
+
+# Use the supplied test labels when they are available
+has_test_labels = target in test_df.columns
+
+if has_test_labels:
+    y_test = test_df[target]
+
+# Exclude high-cardinality text columns to keep processing manageable
+categorical_cols = X_train_all.select_dtypes(
+    include=["object", "category", "bool"]
+).columns.tolist()
+
+high_cardinality_cols = [
+    c for c in categorical_cols
+    if X_train_all[c].nunique(dropna=True) > 100
+]
+
+X_train_all = X_train_all.drop(columns=high_cardinality_cols)
+X_test_all = X_test_all.drop(columns=high_cardinality_cols)
+
+# Use a stratified sample for faster training on large datasets
+if len(X_train_all) > 150000:
+    X_train_all, _, y_train_all, _ = train_test_split(
+        X_train_all,
+        y_train_all,
+        train_size=150000,
+        stratify=y_train_all,
+        random_state=42
+    )
+
+# Create a validation split if the test file has no fraud labels
+if not has_test_labels:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_train_all,
+        y_train_all,
+        test_size=0.2,
+        random_state=42,
+        stratify=y_train_all
+    )
+else:
+    X_train, y_train = X_train_all, y_train_all
+    X_test = X_test_all
+
+numeric_cols = X_train.select_dtypes(
+    include=np.number
+).columns.tolist()
+
+categorical_cols = X_train.select_dtypes(
+    include=["object", "category", "bool"]
+).columns.tolist()
+
+print("Numeric features:", numeric_cols)
+print("Categorical features:", categorical_cols)
+print("Training rows used:", len(X_train))
+print("Testing rows:", len(X_test))
+
+numeric_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer([
+    ("numeric", numeric_pipeline, numeric_cols),
+    ("categorical", categorical_pipeline, categorical_cols)
+])
+
+models = {
+    "Logistic Regression": LogisticRegression(
+        max_iter=500,
+        class_weight="balanced"
+    ),
+
+    "Decision Tree": DecisionTreeClassifier(
+        max_depth=15,
+        class_weight="balanced",
+        random_state=42
+    ),
+
+    "Random Forest": RandomForestClassifier(
+        n_estimators=100,
+        max_depth=20,
+        class_weight="balanced_subsample",
+        random_state=42,
+        n_jobs=-1
+    )
+}
+
+results = []
+trained_models = {}
+
+for name, model in models.items():
+    print(f"\nTraining {name}...")
+
+    pipeline = Pipeline([
+        ("preprocessor", preprocessor),
+        ("model", model)
+    ])
+
+    pipeline.fit(X_train, y_train)
+    predictions = pipeline.predict(X_test)
+
+    results.append({
+        "Model": name,
+        "Accuracy": accuracy_score(y_test, predictions),
+        "Precision": precision_score(
+            y_test, predictions, zero_division=0
+        ),
+        "Recall": recall_score(
+            y_test, predictions, zero_division=0
+        ),
+        "F1 Score": f1_score(
+            y_test, predictions, zero_division=0
+        )
+    })
+
+    trained_models[name] = pipeline
+
+results_df = pd.DataFrame(results).sort_values(
+    by="F1 Score", ascending=False
+)
+
+display(results_df.round(4))
+
+
+
+best_model_name = results_df.iloc[0]["Model"]
+best_model = trained_models[best_model_name]
+
+print("Best model based on F1-score:", best_model_name)
+
+best_predictions = best_model.predict(X_test)
+
+print("\nClassification Report:")
+print(classification_report(
+    y_test,
+    best_predictions,
+    zero_division=0
+))
+
+
+
+cm = confusion_matrix(y_test, best_predictions)
+
+plt.figure(figsize=(6, 4))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=["Legitimate", "Fraud"],
+    yticklabels=["Legitimate", "Fraud"]
+)
+
+plt.xlabel("Predicted Class")
+plt.ylabel("Actual Class")
+plt.title(f"Confusion Matrix - {best_model_name}")
+plt.show()
+
+
+results_melted = results_df.melt(
+    id_vars="Model",
+    value_vars=["Accuracy", "Precision", "Recall", "F1 Score"],
+    var_name="Metric",
+    value_name="Score"
+)
+
+plt.figure(figsize=(10, 5))
+sns.barplot(
+    data=results_melted,
+    x="Model",
+    y="Score",
+    hue="Metric"
+)
+
+plt.title("Comparison of Fraud Detection Models")
+plt.ylim(0, 1)
+plt.xticks(rotation=10)
+plt.tight_layout()
+plt.show()
+
+
+sample = X_test.iloc[[0]]
+
+prediction = best_model.predict(sample)[0]
+
+if prediction == 1:
+    print("Prediction: Fraudulent transaction")
+else:
+    print("Prediction: Legitimate transaction")
+
+
+output = X_test.copy()
+output["predicted_fraud"] = best_predictions
+
+output.to_csv("fraud_predictions.csv", index=False)
+
+print("Predictions saved to fraud_predictions.csv")
